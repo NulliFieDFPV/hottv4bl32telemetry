@@ -1,25 +1,26 @@
 #include <Arduino.h>
 
 // ============================================================================
-// HARDWARE / PIN CONFIGURATION (ESP32-C3)
+// HARDWARE / PIN CONFIGURATION (RP2040-Zero)
 // ============================================================================
-// HoTT ESC #1 (Hardware UART 0)
-#define HOTT1_RX_PIN    4
-#define HOTT1_TX_PIN    5
+// HoTT ESC 1 & 2 nutzen PIO für echten Single-Wire Half-Duplex Betrieb
+#define HOTT1_PIN    0  // GP0 für ESC 1
+#define HOTT2_PIN    1  // GP1 für ESC 2
 
-// HoTT ESC #2 (Hardware UART 1)
-#define HOTT2_RX_PIN    6
-#define HOTT2_TX_PIN    7
-
-// BLHeli_32 Output Stream an FC (Nutzung der Haupt-Serial/USB-CDC oder TX-Pin 21)
-#define FC_TELEMETRY_SERIAL Serial
+// BLHeli32 Output Stream nutzt Hardware UART0
+#define FC_TX_PIN    4  // GP4 (TX0)
+#define FC_RX_PIN    5  // GP5 (Unbenutzt)
 
 // HoTT Sensor Abfrage-ID
 #define HOTT_ESC_REQ_ID 0x8C
 
-// Zwei Hardware-UART Instanzen auf dem ESP32-C3 definieren
-HardwareSerial HottSerial1(0);
-HardwareSerial HottSerial2(1);
+// Hardware UART für den Telemetrie-Output an den Flight Controller
+#define FC_TELEMETRY_SERIAL Serial1
+
+// SoftwareSerial via PIO für echten Single-Wire Half-Duplex Betrieb
+#include <SoftwareSerial.h>
+SoftwareSerial Hott1Serial(HOTT1_PIN, HOTT1_PIN); 
+SoftwareSerial Hott2Serial(HOTT2_PIN, HOTT2_PIN);
 
 // ============================================================================
 // STRUKTUREN & GLOBAL VARS
@@ -32,11 +33,9 @@ struct ESCTelemetryData {
   uint16_t erpm;        // eRPM / 100
 };
 
-// Telemetriedaten für beide Regler
 ESCTelemetryData esc1_telemetry;
 ESCTelemetryData esc2_telemetry;
 
-// Parser-Buffer für beide Kanäle
 uint8_t rxBuffer1[64];
 uint8_t rxIndex1 = 0;
 
@@ -93,9 +92,9 @@ void sendBLHeli32Frame(const ESCTelemetryData &data) {
 }
 
 // ============================================================================
-// HOTT PARSER GENERISCH
+// HOTT PARSER (GENERISCH)
 // ============================================================================
-bool parseHoTTStream(HardwareSerial &port, uint8_t *buffer, uint8_t &index, ESCTelemetryData &outData) {
+bool parseHoTTStream(Stream &port, uint8_t *buffer, uint8_t &index, ESCTelemetryData &outData) {
   while (port.available()) {
     uint8_t b = port.read();
 
@@ -130,7 +129,7 @@ bool parseHoTTStream(HardwareSerial &port, uint8_t *buffer, uint8_t &index, ESCT
         uint16_t raw_rpm     = (buffer[16] << 8) | buffer[15]; 
         outData.erpm         = raw_rpm / 10;
 
-        return true; // Erfolgreich ein valides Frame dekodiert
+        return true; // Valid dekodiertes Paket
       }
     }
   }
@@ -141,36 +140,40 @@ bool parseHoTTStream(HardwareSerial &port, uint8_t *buffer, uint8_t &index, ESCT
 // SETUP & MAIN LOOP
 // ============================================================================
 void setup() {
-  delay(1000); // Boot-Stabilisierung für ESP32-C3
-
-  // Telemetrie-Ausgang an den FC (115200 Baud)
+  // 1. Hardware UART0 für FC-Telemetrie initialisieren (115200 Baud)
+  FC_TELEMETRY_SERIAL.setTX(FC_TX_PIN);
+  FC_TELEMETRY_SERIAL.setRX(FC_RX_PIN);
   FC_TELEMETRY_SERIAL.begin(115200);
 
-  // Beide HoTT UARTs initialisieren (19200 Baud, 8N1)
-  HottSerial1.begin(19200, SERIAL_8N1, HOTT1_RX_PIN, HOTT1_TX_PIN);
-  HottSerial2.begin(19200, SERIAL_8N1, HOTT2_RX_PIN, HOTT2_TX_PIN);
+  // 2. PIO-basierte SoftwareSerial Ports für HoTT initialisieren (19200 Baud)
+  // Das Earle Philhower Core nutzt automatisch die RP2040 PIO-State-Machines
+  // und schaltet die Pins im Single-Wire Modus ohne externe Beschaltung.
+  Hott1Serial.begin(19200);
+  Hott2Serial.begin(19200);
+  
+  // Aktivieren des Half-Duplex Single-Wire Betriebs
+  Hott1Serial.enableIntTx(false); 
+  Hott2Serial.enableIntTx(false);
 }
 
 void loop() {
   uint32_t now = millis();
 
-  // 1. Beide ESCs zeitgleich mit der Polling-ID abfragen
+  // 1. Beide ESCs zeitgleich mit der Request-ID anfragen (Polling)
   if (now - lastHottPollTime >= HOTT_POLL_INTERVAL_MS) {
     lastHottPollTime = now;
-    HottSerial1.write(HOTT_ESC_REQ_ID);
-    HottSerial2.write(HOTT_ESC_REQ_ID);
+    
+    Hott1Serial.write(HOTT_ESC_REQ_ID);
+    Hott2Serial.write(HOTT_ESC_REQ_ID);
   }
 
   // 2. Antwort von ESC 1 verarbeiten & bei neuem Paket senden
-  if (parseHoTTStream(HottSerial1, rxBuffer1, rxIndex1, esc1_telemetry)) {
+  if (parseHoTTStream(Hott1Serial, rxBuffer1, rxIndex1, esc1_telemetry)) {
     sendBLHeli32Frame(esc1_telemetry);
   }
 
   // 3. Antwort von ESC 2 verarbeiten & bei neuem Paket senden
-  if (parseHoTTStream(HottSerial2, rxBuffer2, rxIndex2, esc2_telemetry)) {
+  if (parseHoTTStream(Hott2Serial, rxBuffer2, rxIndex2, esc2_telemetry)) {
     sendBLHeli32Frame(esc2_telemetry);
   }
-
-  // CPU-Entlastung für den ESP32-C3 Single-Core
-  yield();
 }
