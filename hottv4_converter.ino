@@ -1,162 +1,201 @@
 #include <Arduino.h>
+#include <hardware/gpio.h>
+#include <Adafruit_NeoPixel.h>
 
-// ============================================================================
-// HARDWARE / PIN CONFIGURATION (ESP32-C3)
-// ============================================================================
-// HOTT ESC (Single-Wire 19200 Baud): RX & TX Pin anpassen
-// Für Half-Duplex Single-Wire werden RX und TX extern/intern auf denselben Bus gelegt.
-#define HOTT_RX_PIN    4
-#define HOTT_TX_PIN    5
+#define HOTT_TX_PIN         0
+#define HOTT_RX_PIN         1
+#define HOTT_BAUD           19200
+#define HOTT_ESC_REQ_1      0x80
+#define HOTT_ESC_REQ_2      0x8C
+#define HOTT_FRAME_SIZE     45
 
-// BLHeli32 / KISS Telemetrie Output an den Flight Controller (115200 Baud)
-// Falls du USB-Serial zur FC nutzt, verwende Serial. Hier nutzen wir Serial1 für physische Pins:
-#define FC_TELEMETRY_SERIAL Serial1
-#define FC_TX_PIN           21  // Sendet BLHeli32 Stream an FC RX
-#define FC_RX_PIN           20  // Dummy / Unbenutzt
+// Neuer Port für BLHeli_32 Telemetrie-Ausgabe (z.B. zu Flight Controller UART)
+#define BLHELI_TX_PIN       4
+#define BLHELI_RX_PIN       5
+#define BLHELI_BAUD         115200 // Standard für BLHeli_32 Telemetrie in Betaflight/INav
 
-// HoTT ESC Sensor ID
-#define HOTT_ESC_REQ_ID   0x8C  // Standard Abfrage-ID für HoTT ESC Modul
+// WS2812 RGB LED Konfiguration
+#define NUMPIXELS           1
 
-// HardwareSerial Objekt für HoTT (UART 0 auf freie Pins gemappt)
-HardwareSerial HottSerial(0);
+Adafruit_NeoPixel strip(NUMPIXELS, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 
-// ============================================================================
-// STRUKTUREN & GLOBAL VARS
-// ============================================================================
-struct ESCTelemetryData {
-  uint8_t  temp_c;      // Temperatur in °C
-  uint16_t voltage_10mv;// Spannung in 0.01V (10mV Einheiten)
-  uint16_t current_10ma;// Strom in 0.01A (10mA Einheiten)
-  uint16_t mah_consumed;// Verbrauch in mAh
-  uint16_t erpm;        // Elektrische RPM / 100
-} telemetry;
+uint8_t rxBuffer[HOTT_FRAME_SIZE];
+uint8_t bufferIdx = 0;
+unsigned long lastRequestTime = 0;
+unsigned long lastLedUpdate = 0;
 
-uint32_t lastHottPollTime = 0;
-const uint32_t HOTT_POLL_INTERVAL_MS = 100; // 10Hz Abfrage-Intervall für HoTT
+enum LedState {
+    LED_STATE_STANDBY,
+    LED_STATE_POLL,
+    LED_STATE_SUCCESS,
+    LED_STATE_ERROR
+};
 
-// ============================================================================
-// HELPER: CRC8 BERECHNUNG (DOW-CRC8 für BLHeli32 / KISS)
-// ============================================================================
-uint8_t updateCRC8(uint8_t crc, uint8_t data) {
-  crc ^= data;
-  for (uint8_t i = 0; i < 8; i++) {
-    if (crc & 0x80) {
-      crc = (crc << 1) ^ 0x07;
-    } else {
-      crc <<= 1;
-    }
-  }
-  return crc;
+LedState currentLedState = LED_STATE_STANDBY;
+unsigned long stateTriggerTime = 0;
+const unsigned long flashDuration = 60;
+
+void setLedColor(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness = 30) {
+    strip.setBrightness(brightness);
+    strip.setPixelColor(0, strip.Color(r, g, b));
+    strip.show();
 }
 
-uint8_t calculateBLHeliCRC(const uint8_t *buf, uint8_t len) {
-  uint8_t crc = 0;
-  for (uint8_t i = 0; i < len; i++) {
-    crc = updateCRC8(crc, buf[i]);
-  }
-  return crc;
-}
+void updateLedPattern() {
+    unsigned long now = millis();
 
-// ============================================================================
-// BLHELI_32 TELEMETRIE STREAM
-// ============================================================================
-void sendBLHeli32Frame() {
-  uint8_t frame[10];
-
-  frame[0] = telemetry.temp_c;                       // Temp in °C
-  frame[1] = (telemetry.voltage_10mv >> 8) & 0xFF;    // Voltage High Byte
-  frame[2] = telemetry.voltage_10mv & 0xFF;           // Voltage Low Byte
-  frame[3] = (telemetry.current_10ma >> 8) & 0xFF;    // Current High Byte
-  frame[4] = telemetry.current_10ma & 0xFF;           // Current Low Byte
-  frame[5] = (telemetry.mah_consumed >> 8) & 0xFF;    // mAh High Byte
-  frame[6] = telemetry.mah_consumed & 0xFF;           // mAh Low Byte
-  frame[7] = (telemetry.erpm >> 8) & 0xFF;            // eRPM/100 High Byte
-  frame[8] = telemetry.erpm & 0xFF;                   // eRPM/100 Low Byte
-  
-  // Byte 9: DOW-CRC8
-  frame[9] = calculateBLHeliCRC(frame, 9);
-
-  // Frame an Flight Controller senden
-  FC_TELEMETRY_SERIAL.write(frame, 10);
-}
-
-// ============================================================================
-// HOTT PARSER
-// ============================================================================
-void pollHoTTESC() {
-  // HoTT Master Request
-  HottSerial.write(HOTT_ESC_REQ_ID);
-}
-
-void parseHoTTResponse() {
-  static uint8_t rxBuffer[64];
-  static uint8_t rxIndex = 0;
-
-  while (HottSerial.available()) {
-    uint8_t b = HottSerial.read();
-
-    // Start-Byte 0x7C suchen
-    if (rxIndex == 0 && b != 0x7C) {
-      continue;
+    if (currentLedState != LED_STATE_STANDBY) {
+        if (now - stateTriggerTime > flashDuration) {
+            currentLedState = LED_STATE_STANDBY;
+        } else {
+            switch (currentLedState) {
+                case LED_STATE_POLL:
+                    setLedColor(0, 0, 255, 40);
+                    break;
+                case LED_STATE_SUCCESS:
+                    setLedColor(0, 255, 0, 40);
+                    break;
+                case LED_STATE_ERROR:
+                    setLedColor(255, 80, 0, 40);
+                    break;
+                default:
+                    break;
+            }
+            return;
+        }
     }
 
-    rxBuffer[rxIndex++] = b;
-
-    // Standard HoTT Frame Länge: 45 Bytes
-    if (rxIndex >= 45) {
-      uint8_t checksum = 0;
-      for (uint8_t i = 0; i < 44; i++) {
-        checksum += rxBuffer[i];
-      }
-
-      if (checksum == rxBuffer[44]) {
-        // Daten aus HoTT Frame extrahieren
-        telemetry.temp_c       = rxBuffer[21] - 20; 
-        
-        uint16_t raw_voltage   = (rxBuffer[18] << 8) | rxBuffer[17]; 
-        telemetry.voltage_10mv = raw_voltage * 10;                  
-        
-        uint16_t raw_current   = (rxBuffer[20] << 8) | rxBuffer[19]; 
-        telemetry.current_10ma = raw_current * 10;                  
-        
-        telemetry.mah_consumed = (rxBuffer[23] << 8) | rxBuffer[22]; 
-        
-        uint16_t raw_rpm       = (rxBuffer[16] << 8) | rxBuffer[15]; 
-        telemetry.erpm         = raw_rpm / 10;                       
-        
-        // Weiterleitung an den FC
-        sendBLHeli32Frame();
-      }
-
-      rxIndex = 0;
+    if (now - lastLedUpdate >= 15) {
+        lastLedUpdate = now;
+        float breath = (sin(now / 400.0 * 3.14159) + 1.0) / 2.0;
+        uint8_t brightness = (uint8_t)(2.0 + (breath * 25.0));
+        setLedColor(0, 150, 150, brightness);
     }
-  }
 }
 
-// ============================================================================
-// SETUP & MAIN LOOP
-// ============================================================================
+// Funktion zum Senden von BLHeli_32 Telemetrie
+void sendBlheliTelemetry(uint16_t voltageRaw, uint16_t currentRaw, uint16_t rpmRaw, uint8_t temperature) {
+    uint8_t blheliPacket[8];
+    
+    blheliPacket[0] = temperature;                 // Temperatur in °C
+    blheliPacket[1] = (voltageRaw >> 8) & 0xFF;    // Spannung MSB
+    blheliPacket[2] = voltageRaw & 0xFF;           // Spannung LSB
+    blheliPacket[3] = (currentRaw >> 8) & 0xFF;    // Strom MSB
+    blheliPacket[4] = currentRaw & 0xFF;           // Strom LSB
+    blheliPacket[5] = (rpmRaw >> 8) & 0xFF;        // RPM MSB
+    blheliPacket[6] = rpmRaw & 0xFF;               // RPM LSB
+
+    // Einfache XOR/Add-Checksumme (Beispielhaft für BLHeli-Stream)
+    uint8_t crc = 0;
+    for (int i = 0; i < 7; i++) {
+        crc += blheliPacket[i];
+    }
+    blheliPacket[7] = crc;
+
+    // Ausgabe über Serial2 an den Flight Controller
+    Serial2.write(blheliPacket, 8);
+    Serial2.flush();
+}
+
 void setup() {
-  // Wichtig für ESP32-C3: Kurze Pause für stabile Spannungsversorgung beim Booten
-  delay(1000);
+    Serial.begin(115200);
+    while (!Serial && millis() < 3000);
 
-  // HoTT Serial initialisieren (UART0 auf custom Pins mappen)
-  HottSerial.begin(19200, SERIAL_8N1, HOTT_RX_PIN, HOTT_TX_PIN);
+    strip.begin();
+    setLedColor(0, 150, 150, 10);
 
-  // FC Telemetry Serial initialisieren (UART1 auf custom Pins mappen)
-  FC_TELEMETRY_SERIAL.begin(115200, SERIAL_8N1, FC_RX_PIN, FC_TX_PIN);
+    // YGE HoTT UART (Serial1)
+    Serial1.setTX(HOTT_TX_PIN);
+    Serial1.setRX(HOTT_RX_PIN);
+    Serial1.begin(HOTT_BAUD, SERIAL_8N1);
+
+    // BLHeli_32 Ausgangs-UART (Serial2)
+    Serial2.setTX(BLHELI_TX_PIN);
+    Serial2.setRX(BLHELI_RX_PIN);
+    Serial2.begin(BLHELI_BAUD, SERIAL_8N1);
+
+    Serial.println("\n--- YGE HoTT zu BLHeli_32 Bridge gestartet ---");
+}
+
+void sendHottRequestOpenDrain() {
+    gpio_set_function(HOTT_TX_PIN, GPIO_FUNC_UART);
+    uint8_t request[2] = { HOTT_ESC_REQ_1, HOTT_ESC_REQ_2 };
+    Serial1.write(request, 2);
+    Serial1.flush();
+
+    unsigned long t0 = millis();
+    int readEcho = 0;
+    while (readEcho < 2 && (millis() - t0 < 5)) {
+        if (Serial1.available()) {
+            Serial1.read();
+            readEcho++;
+        }
+    }
+
+    gpio_set_function(HOTT_TX_PIN, GPIO_FUNC_SIO);
+    gpio_set_dir(HOTT_TX_PIN, GPIO_IN);
+
+    currentLedState = LED_STATE_POLL;
+    stateTriggerTime = millis();
+}
+
+void analyzeFrame(uint8_t *data) {
+    uint8_t crc = 0;
+    for (uint8_t i = 0; i < HOTT_FRAME_SIZE - 1; i++) crc += data[i];
+
+    if (crc != data[HOTT_FRAME_SIZE - 1]) {
+        Serial.println("[CRC ERROR]");
+        currentLedState = LED_STATE_ERROR;
+        stateTriggerTime = millis();
+        return;
+    }
+
+    currentLedState = LED_STATE_SUCCESS;
+    stateTriggerTime = millis();
+
+    uint16_t currentRaw  = data[14] | (data[15] << 8);
+    uint16_t voltageRaw  = data[6]  | (data[7]  << 8);
+    uint16_t capacityRaw = data[10] | (data[11] << 8);
+    uint16_t rpmRaw      = data[18] | (data[19] << 8);
+    uint16_t escTempRaw  = data[12] << 8;
+
+    float current  = currentRaw / 10.0f;
+    float voltage  = voltageRaw / 10.0f;
+    uint32_t capacity = capacityRaw * 10;
+    uint32_t rpm  = rpmRaw * 10;
+    uint8_t escTemp = (uint8_t)(escTempRaw / 1000.0f + 20);
+
+    // BLHeli-kompatible Telemetrie an Port 2 ausgeben
+    // Hinweis: BLHeli erwartet oft RPM als Erpmm (Electrical RPM) oder direkt, 
+    // hier übergeben wir die rohen/skalierten Werte passend aufbereitet.
+    sendBlheliTelemetry(voltageRaw, currentRaw, rpmRaw, escTemp);
+
+    Serial.println("\n================ YGE HoTT -> BLHeli Bridge ================");
+    Serial.printf("Spannung: %5.1f V | Strom: %5.1f A | RPM: %u | Temp: %u C\n", voltage, current, rpm, escTemp);
 }
 
 void loop() {
-  uint32_t now = millis();
+    unsigned long now = millis();
+    
+    updateLedPattern();
 
-  if (now - lastHottPollTime >= HOTT_POLL_INTERVAL_MS) {
-    lastHottPollTime = now;
-    pollHoTTESC();
-  }
+    if (now - lastRequestTime >= 500) {
+        lastRequestTime = now;
+        bufferIdx = 0;
+        while (Serial1.available()) Serial1.read();
+        sendHottRequestOpenDrain();
+    }
 
-  parseHoTTResponse();
+    while (Serial1.available()) {
+        uint8_t byteIn = Serial1.read();
+        if (bufferIdx == 0 && byteIn != 0x7C) continue;
+        if (bufferIdx == 1 && byteIn != 0x8C) { bufferIdx = 0; continue; }
 
-  // ESP32 Watchdog / Task Yielding (verhindert WDT Reset auf dem Single-Core ESP32-C3)
-  yield();
+        rxBuffer[bufferIdx++] = byteIn;
+
+        if (bufferIdx == HOTT_FRAME_SIZE) {
+            analyzeFrame(rxBuffer);
+            bufferIdx = 0;
+        }
+    }
 }
